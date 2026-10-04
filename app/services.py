@@ -14,7 +14,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from . import attribution
+from . import attribution, reconciliation
 from .attribution import EventView, RulingView
 from .config import settings
 from .models import (
@@ -1256,6 +1256,130 @@ def list_changes(
     page = [(rev, shift) for rev, shift in rows]
     next_cursor = page[-1][0].seq if page else cursor
     return page, next_cursor
+
+
+# ---------------------------------------------------------------- 现场停机对账（按设备）
+
+
+def reconcile_device_downtime(
+    db: Session,
+    device_id: str,
+    start: datetime,
+    end: datetime,
+    field_intervals: list[tuple[datetime, datetime]],
+    seq: int | None,
+) -> dict:
+    """按设备对账现场停机记录与系统已结算归因。
+
+    - 未指定 seq 时固定为请求开始时已提交的最大变更序号；seq 超过当前最大
+      序号明确报错（不用当前结果替代）；
+    - 取与半开窗口相交的班次中、截至 seq 已结算的班次（seq ≤ seq 有修订），
+      每班选序号 ≤ seq 的最后修订；系统停机 = 这些修订固化归因明细（三类
+      归因段）的并集，已结算覆盖 = 班次区间与窗口交集的并集；
+    - 仅在已结算覆盖内比较现场/系统差异；现场落在覆盖外的分钟另计未对账；
+    - 所选修订为明细结构引入前的历史修订（segments_available=FALSE，当时
+      裁定状态无法可靠还原）时明确报错，不以当前状态推算。
+    """
+    get_device_or_404(db, device_id)
+    win_start, win_end = _utc(start), _utc(end)
+    max_committed_seq = _current_max_seq(db)
+    if seq is None:
+        pinned_seq = max_committed_seq  # 固定查询开始时的最新序号
+    elif seq > max_committed_seq:
+        raise ApiError(
+            422,
+            "INVALID_SEQ",
+            f"reconciliation seq {seq} is beyond the latest committed change "
+            f"seq {max_committed_seq}; omit seq to pin the current maximum "
+            f"or specify a seq no greater than {max_committed_seq} (0 allowed)",
+        )
+    else:
+        pinned_seq = seq
+
+    # 每班次截至 pinned_seq 的最后修订（与班次快照同一选择规则，历史行不可变）
+    last_rev_subq = (
+        select(
+            ShiftResult.shift_id.label("shift_id"),
+            func.max(ShiftResult.revision).label("max_revision"),
+        )
+        .where(ShiftResult.seq <= pinned_seq)
+        .group_by(ShiftResult.shift_id)
+        .subquery()
+    )
+    rows = db.execute(
+        select(Shift, ShiftResult)
+        .join(ShiftResult, ShiftResult.shift_id == Shift.id)
+        .join(
+            last_rev_subq,
+            and_(
+                last_rev_subq.c.shift_id == ShiftResult.shift_id,
+                last_rev_subq.c.max_revision == ShiftResult.revision,
+            ),
+        )
+        .where(
+            Shift.device_id == device_id,
+            Shift.start_ts < win_end,
+            Shift.end_ts > win_start,
+        )
+        .order_by(Shift.id)
+    ).all()
+
+    shift_views: list[reconciliation.ShiftCoverage] = []
+    shift_refs: list[dict] = []
+    for shift, rev in rows:
+        if not rev.segments_available:
+            raise ApiError(
+                422,
+                "SEGMENTS_UNAVAILABLE",
+                f"shift id={shift.id} revision {rev.revision} (seq={rev.seq}) "
+                "has no frozen result segments; the historical ruling state "
+                "cannot be reliably reconstructed, so reconciliation at "
+                f"seq={pinned_seq} is refused (current state is never substituted)",
+            )
+        seg_rows = (
+            db.execute(
+                select(ShiftResultSegment.start_ts, ShiftResultSegment.end_ts)
+                .where(
+                    ShiftResultSegment.shift_id == shift.id,
+                    ShiftResultSegment.revision == rev.revision,
+                )
+                .order_by(ShiftResultSegment.seg_no)
+            )
+            .all()
+        )
+        shift_views.append(
+            reconciliation.ShiftCoverage(
+                shift_id=shift.id,
+                revision=rev.revision,
+                seq=rev.seq,
+                coverage=(shift.start_ts, shift.end_ts),
+                intervals=[(s, e) for s, e in seg_rows],
+            )
+        )
+        shift_refs.append(
+            {"shift_id": shift.id, "revision": rev.revision, "seq": rev.seq}
+        )
+
+    result = reconciliation.reconcile(
+        win_start,
+        win_end,
+        [(_utc(s), _utc(e)) for s, e in field_intervals],
+        shift_views,
+    )
+    return {
+        "device_id": device_id,
+        "start": start,
+        "end": end,
+        "seq": pinned_seq,
+        "settled_minutes": result.settled_minutes,
+        "field_only": result.field_only,
+        "field_only_minutes": result.field_only_minutes,
+        "system_only": result.system_only,
+        "system_only_minutes": result.system_only_minutes,
+        "unreconciled": result.unreconciled,
+        "unreconciled_minutes": result.unreconciled_minutes,
+        "reconciled_shifts": shift_refs,
+    }
 
 
 # ---------------------------------------------------------------- 班次归因快照

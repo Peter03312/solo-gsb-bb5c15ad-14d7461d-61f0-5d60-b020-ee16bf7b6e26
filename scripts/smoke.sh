@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 冒烟脚本：走完 设备→班次→事件→幂等/冲突→结算→迟到更正→现场裁定/撤销→断网批量补传→事件预演/确认→修订/变更查询→班次快照 全流程。
+# 冒烟脚本：走完 设备→班次→事件→幂等/冲突→结算→迟到更正→现场裁定/撤销→断网批量补传→事件预演/确认→修订/变更查询→班次快照→现场对账 全流程。
 # 用法：./scripts/smoke.sh [BASE_URL]   （默认 http://localhost:8000）
 set -euo pipefail
 
@@ -190,3 +190,19 @@ req GET "/devices/NOPE/shift-snapshots?start=2026-10-01T00:00:00%2B08:00&end=202
 echo "-- 非法区间 / 未知设备，预期 422 / 404 --"
 req POST /shifts '{"device_id":"CNC-01","start":"2026-10-02T16:00:00+08:00","end":"2026-10-02T08:00:00+08:00"}'
 req POST /events '{"device_id":"NOPE","source_id":"X","version":1,"start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:00:00+08:00","reason":"failure"}'
+
+echo "-- 现场停机对账：窗口 10/1，现场报 09:30-10:30 + 班次外 20:00-21:00；seq 缺省固定当前最新 --"
+req POST /devices/CNC-01/downtime-reconciliation '{"start":"2026-10-01T00:00:00+08:00","end":"2026-10-02T00:00:00+08:00","field_intervals":[
+  {"start":"2026-10-01T09:30:00+08:00","end":"2026-10-01T10:30:00+08:00"},
+  {"start":"2026-10-01T20:00:00+08:00","end":"2026-10-01T21:00:00+08:00"}]}'
+
+echo "-- 固定 seq=1 重放（取各班次截至序号 1 的最后修订；结果携带所用序号）--"
+req POST /devices/CNC-01/downtime-reconciliation '{"start":"2026-10-01T00:00:00+08:00","end":"2026-10-02T00:00:00+08:00","seq":1,"field_intervals":[
+  {"start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T12:00:00+08:00"}]}'
+
+echo "-- 对账序号越界：预期 422 INVALID_SEQ --"
+req POST /devices/CNC-01/downtime-reconciliation '{"start":"2026-10-01T00:00:00+08:00","end":"2026-10-02T00:00:00+08:00","seq":999999,"field_intervals":[]}'
+
+echo "-- 对账非法窗口（缺时区 / start≥end）与未知设备：预期 422 / 404 --"
+req POST /devices/CNC-01/downtime-reconciliation '{"start":"2026-10-01T00:00:00","end":"2026-10-02T00:00:00+08:00","field_intervals":[]}'
+req POST /devices/NOPE/downtime-reconciliation '{"start":"2026-10-02T00:00:00+08:00","end":"2026-10-01T00:00:00+08:00","field_intervals":[]}'

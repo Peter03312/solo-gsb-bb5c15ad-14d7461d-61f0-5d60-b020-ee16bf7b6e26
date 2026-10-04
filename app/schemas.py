@@ -325,6 +325,78 @@ class RevisionRef(BaseModel):
     trigger: str
 
 
+# ---------------------------------------------------------------- 现场停机对账（按设备）
+
+
+class FieldIntervalIn(_Interval):
+    """现场停机区间（整分钟、半开）；可与窗口部分相交，服务端裁剪到窗口后合并。"""
+
+
+class ReconciliationIn(BaseModel):
+    """按设备对账请求：窗口 + 现场停机区间列表 + 可选固定变更序号。"""
+
+    start: datetime
+    end: datetime
+    field_intervals: list[FieldIntervalIn] = Field(
+        default_factory=list, description="现场停机区间列表（整分钟半开）；裁剪到窗口后合并重叠"
+    )
+    seq: int | None = Field(
+        default=None,
+        ge=0,
+        description="固定变更序号；缺省时以请求开始时已提交的最大序号为准",
+    )
+
+    @field_validator("start", "end")
+    @classmethod
+    def _ts(cls, v: datetime) -> datetime:
+        return _check_ts(v)
+
+    @model_validator(mode="after")
+    def _range(self):
+        if not self.start < self.end:
+            raise ValueError("invalid window: start must be earlier than end")
+        return self
+
+
+class ReconciliationInterval(BaseModel):
+    """对账结果中的最大连续区间（半开，UTC 输出）及分钟数。"""
+
+    start: datetime
+    end: datetime
+    minutes: int
+
+
+class ReconciledShiftRef(BaseModel):
+    """对账所用的各已结算班次及其固定序号下选取的修订（便于重放核对）。"""
+
+    shift_id: int
+    revision: int
+    seq: int  # 该修订的全局变更序号（均 ≤ 对账所用序号）
+
+
+class ReconciliationOut(BaseModel):
+    """设备停机对账结果。
+
+    - field_only：已结算覆盖分钟内现场有、系统无的最大连续区间（差异）；
+    - system_only：系统有、现场无的最大连续区间（差异）；
+    - unreconciled：现场记录落在已结算班次之外的分钟（未对账，不算差异）；
+    - seq：本次实际使用的变更序号（未指定时固定为请求开始时的最新序号），可凭此重放。
+    """
+
+    device_id: str
+    start: datetime
+    end: datetime
+    seq: int
+    settled_minutes: int  # 窗口内已结算班次覆盖的分钟总数（对账范围）
+    field_only: list[ReconciliationInterval]
+    field_only_minutes: int
+    system_only: list[ReconciliationInterval]
+    system_only_minutes: int
+    unreconciled: list[ReconciliationInterval]
+    unreconciled_minutes: int
+    reconciled_shifts: list[ReconciledShiftRef]
+
+
 class AdjudicationAck(BaseModel):
     """提交/撤销裁定的统一回执：单号、状态、修订号（无修订时明确标示）。"""
 

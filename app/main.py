@@ -32,6 +32,10 @@ from .schemas import (
     EventVersionRef,
     ReasonMinutes,
     RecomputedShift,
+    ReconciledShiftRef,
+    ReconciliationIn,
+    ReconciliationInterval,
+    ReconciliationOut,
     ResultOut,
     ResultSegmentOut,
     ResultSegmentsOut,
@@ -54,7 +58,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="设备停机归因服务",
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "按班次对设备停机时间进行归因（保养/故障/待判）。"
         "区间均为半开 [start, end)；重叠时保养 > 故障 > 待判，每分钟只归因一次；"
@@ -70,7 +74,10 @@ app = FastAPI(
         "供下游报表首次接入或重建索引；"
         "GET /shifts/{shift_id}/result/segments 提供与修订同事务固化的不可变归因区间"
         "明细（按起点排序、互不重叠的半开区间，含起止、原因及依据），"
-        "历史修订未固化明细时明确返回不可用。"
+        "历史修订未固化明细时明确返回不可用；"
+        "POST /devices/{device_id}/downtime-reconciliation 按固定变更序号对账现场"
+        "停机记录与系统已结算归因（仅在已结算班次覆盖分钟比较，差异与未对账"
+        "分钟分别给出最大连续区间，结果携带所用序号以便重放）。"
     ),
     lifespan=lifespan,
 )
@@ -617,4 +624,62 @@ def get_shift_snapshot(
         snapshot_seq=snapshot_seq,
         shifts=[_snapshot_entry(shift, rev) for shift, rev in page],
         next_cursor=next_cursor,
+    )
+
+
+# ---------------------------------------------------------------- 现场停机对账（按设备）
+
+
+def _reconciliation_intervals(intervals: list) -> list[ReconciliationInterval]:
+    return [
+        ReconciliationInterval(
+            start=s,
+            end=e,
+            minutes=int((e - s).total_seconds()) // 60,
+        )
+        for s, e in intervals
+    ]
+
+
+@app.post(
+    "/devices/{device_id}/downtime-reconciliation",
+    response_model=ReconciliationOut,
+    tags=["reconciliation"],
+)
+def reconcile_downtime(device_id: str, payload: ReconciliationIn, db: Session = Depends(get_db)):
+    """按设备对账现场停机记录与系统已结算归因（固定变更序号，可重放）。
+
+    - 现场区间先裁剪到半开窗口 [start, end) 并合并重叠；系统侧按该序号选取
+      各相交班次的**最后修订**及其固化归因明细，三类归因段（保养/故障/待判）
+      的并集代表系统停机；
+    - 仅在该序号下已结算班次覆盖的分钟内比较：按时间顺序返回现场有而系统无
+      （field_only）、系统有而现场无（system_only）的最大连续区间及分钟总数；
+      不在已结算班次内的现场分钟另计 unreconciled（未对账，不算差异）；
+    - seq 缺省时固定为请求开始时已提交的最大变更序号，结果回传该序号以便重放；
+    - seq 超过当前最大序号 → 422 INVALID_SEQ；所选修订固化明细不可用
+      （结构引入前的历史修订）→ 422 SEGMENTS_UNAVAILABLE（不以当前结果替代）；
+      未知设备 → 404 DEVICE_NOT_FOUND；窗口/区间缺时区、未对齐整分钟或
+      start ≥ end → 422 VALIDATION_ERROR。
+    """
+    result = services.reconcile_device_downtime(
+        db,
+        device_id,
+        payload.start,
+        payload.end,
+        [(iv.start, iv.end) for iv in payload.field_intervals],
+        payload.seq,
+    )
+    return ReconciliationOut(
+        device_id=result["device_id"],
+        start=result["start"],
+        end=result["end"],
+        seq=result["seq"],
+        settled_minutes=result["settled_minutes"],
+        field_only=_reconciliation_intervals(result["field_only"]),
+        field_only_minutes=result["field_only_minutes"],
+        system_only=_reconciliation_intervals(result["system_only"]),
+        system_only_minutes=result["system_only_minutes"],
+        unreconciled=_reconciliation_intervals(result["unreconciled"]),
+        unreconciled_minutes=result["unreconciled_minutes"],
+        reconciled_shifts=[ReconciledShiftRef(**ref) for ref in result["reconciled_shifts"]],
     )

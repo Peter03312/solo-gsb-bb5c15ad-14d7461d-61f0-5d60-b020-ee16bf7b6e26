@@ -14,7 +14,12 @@
 每个新生成的班次修订都会**同事务固化不可变的归因区间明细**（`GET /shifts/{id}/result/segments`）：
 按起点排序、互不重叠的半开区间，逐段给出起止、原因及依据（生效裁定单号，或该区间内决定此原因的
 事件来源与版本列表），使结算总分钟数的每一段都可解释；历史修订若无法可靠还原裁定状态，
-明确返回明细不可用，不以当前状态推算。
+明确返回明细不可用，不以当前状态推算。现场停机记录与已结算归因可经
+`POST /devices/{id}/downtime-reconciliation` **按设备对账**：输入带时区整分钟的半开窗口、现场
+停机区间列表与可选全局变更序号（缺省固定查询开始时的最新序号），系统侧按该序号取各相交班次
+**最后修订的固化明细**（三类归因段并集）代表系统停机，仅在已结算班次覆盖的分钟内比较，按时间
+顺序返回现场有/系统无、系统有/现场无的最大连续区间及分钟总数；覆盖外的现场分钟另计未对账、
+不算差异，结果携带所用序号以便重放。
 
 技术栈：Python 3.12 · FastAPI · SQLAlchemy 2 · PostgreSQL 16 · Docker Compose
 
@@ -142,6 +147,7 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
 | `GET` | `/shifts/{id}/adjudications` | 班次的全部裁定（含已撤销，按生效顺序） |
 | `GET` | `/changes?cursor=&limit=` | 变更同步：按全局递增游标分页读取结算/更正/裁定/撤销变更 |
 | `GET` | `/devices/{device_id}/shift-snapshots?start=&end=&seq=&limit=&cursor=` | 班次归因快照：按固定变更序号取与窗口相交、已结算班次的最后修订（首次接入/重建索引） |
+| `POST` | `/devices/{device_id}/downtime-reconciliation` | 按设备对账现场停机与系统已结算归因（固定序号、差异与未对账分钟分别给最大连续区间） |
 | `GET` | `/health` | 健康检查 |
 
 原因枚举：`maintenance`（保养）、`failure`（故障）、`pending`（待判）。
@@ -166,6 +172,8 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
 | 422 | `INVALID_CONFIRM_TOKEN` | 确认凭据损坏、伪造或类型不符（如误用快照续页游标）；需重新预演获取凭据 |
 | 422 | `INVALID_CURSOR` | 同步游标超过当前最大变更序号（客户端进度异常，需从较小游标重新同步）；快照续页游标损坏、伪造或与设备/窗口/快照序号不匹配 |
 | 422 | `INVALID_SNAPSHOT_SEQ` | 快照序号超过当前已提交的最大变更序号（可取 0 或当前最大序号） |
+| 422 | `INVALID_SEQ` | 对账序号超过当前已提交的最大变更序号（可取 0；省略则固定为当前最大序号） |
+| 422 | `SEGMENTS_UNAVAILABLE` | 对账所选班次在该序号下的最后修订未固化归因明细（结构引入前的历史修订，当时裁定状态无法可靠还原），拒绝以当前状态推算 |
 
 ## 调用示例
 
@@ -744,6 +752,108 @@ curl 'http://localhost:8000/devices/CNC-01/shift-snapshots?start=2026-10-01T00:0
 curl 'http://localhost:8000/devices/NOPE/shift-snapshots?start=2026-10-01T00:00:00%2B08:00&end=2026-10-04T00:00:00%2B08:00'
 ```
 
+## 现场停机对账（按设备，按固定变更序号）
+
+现场停机记录（如班组纸质/网关补录）与系统**已结算归因**可能不一致：
+`POST /devices/{device_id}/downtime-reconciliation` 按设备、按一个**固定变更序号**对账，
+只比较该序号下**已结算班次覆盖**的分钟，输出两侧差异的最大连续区间，序号随结果回传以便重放。
+
+**请求体**（JSON）
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `start` / `end` | 是 | 半开对账窗口 `[start, end)`，必须带时区且精确到整分钟，`start < end` |
+| `field_intervals` | 否 | 现场停机区间列表（每项整分钟半开），无需落在窗口/班次内；服务端先**裁剪到窗口并合并重叠** |
+| `seq` | 否 | 固定变更序号；**缺省时以请求开始时已提交的最大序号为准**（整个对账固定在该序号） |
+
+**对账语义**
+
+- 系统侧：取与窗口**相交**（半开，端点相接不算）的班次中、截至 `seq` **已结算**的班次，
+  每班选 **序号 ≤ `seq` 的最后修订**（与班次快照同一选择规则，历史修订不可变）；
+  **系统停机 = 这些修订固化归因明细（保养/故障/待判三类段）的并集** —— 三类原因一律视为停机，
+  对账不再区分原因；
+- **已结算覆盖** = 各相交班次区间与窗口交集的并集（班次内未停机分钟也在对账范围内）；
+- 逐分钟比较只在已结算覆盖内进行，结果均为按时间顺序的**最大连续半开区间**：
+  - `field_only`：现场有、系统无（差异），合计 `field_only_minutes`；
+  - `system_only`：系统有、现场无（差异），合计 `system_only_minutes`；
+  - `unreconciled`：现场记录落在**任何已结算班次之外**的分钟（班次间隙、未结算班次、窗口内
+    无班次时段），**另计未对账、不算差异**，合计 `unreconciled_minutes`；
+- `settled_minutes` 为窗口内已结算覆盖总分钟（对账范围）；`reconciled_shifts` 列出实际参与
+  对账的班次及其所选修订/序号，便于核对；`seq` 为本次实际使用的序号 —— 之后数据再变化，
+  携带同一 `seq` 重放结果不变。
+
+**错误**
+
+- `seq` 超过当前已提交最大序号 → `422 INVALID_SEQ`（`seq=0` 合法：无任何结算时空对账，
+  现场分钟全部计未对账）；
+- 所选修订为明细结构引入前的历史修订（`segments_available=FALSE`，当时裁定状态无法可靠
+  还原）→ `422 SEGMENTS_UNAVAILABLE`，**不以当前状态推算替代**；
+- 未知设备 → `404 DEVICE_NOT_FOUND`；窗口/现场区间缺时区、未对齐整分钟、`start ≥ end`、
+  `seq < 0` → `422 VALIDATION_ERROR`。
+
+**调用示例**（设备 `CNC-01`，10/1 早班 08:00–16:00 已结算；系统固化明细为故障 10:00–11:00）
+
+```bash
+# 现场记录：09:30–10:30 停机（与系统重叠 10:00–10:30）；不指定 seq → 固定当前最新序号
+curl -X POST http://localhost:8000/devices/CNC-01/downtime-reconciliation \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "start": "2026-10-01T00:00:00+08:00",
+    "end":   "2026-10-02T00:00:00+08:00",
+    "field_intervals": [
+      {"start": "2026-10-01T09:30:00+08:00", "end": "2026-10-01T10:30:00+08:00"}
+    ]
+  }'
+```
+
+```json
+{
+  "device_id": "CNC-01",
+  "start": "2026-10-01T00:00:00+08:00",
+  "end": "2026-10-02T00:00:00+08:00",
+  "seq": 1,
+  "settled_minutes": 480,
+  "field_only": [
+    {"start": "2026-10-01T01:30:00Z", "end": "2026-10-01T02:00:00Z", "minutes": 30}
+  ],
+  "field_only_minutes": 30,
+  "system_only": [
+    {"start": "2026-10-01T02:30:00Z", "end": "2026-10-01T03:00:00Z", "minutes": 30}
+  ],
+  "system_only_minutes": 30,
+  "unreconciled": [],
+  "unreconciled_minutes": 0,
+  "reconciled_shifts": [{"shift_id": 1, "revision": 1, "seq": 1}]
+}
+```
+
+> 现场 09:30–10:00 在已结算班次内但系统无停机 → 现场差异；系统 10:30–11:00 现场无记录
+> → 系统差异；两侧重叠的 10:00–10:30 一致，不出现。
+
+```bash
+# 覆盖外的现场分钟（班次外 / 未结算班次 / 班次间隙）→ unreconciled，不算差异
+curl -X POST http://localhost:8000/devices/CNC-01/downtime-reconciliation \
+  -H 'Content-Type: application/json' \
+  -d '{"start":"2026-10-01T00:00:00+08:00","end":"2026-10-02T00:00:00+08:00",
+       "field_intervals":[
+         {"start":"2026-10-01T12:00:00+08:00","end":"2026-10-01T13:00:00+08:00"},
+         {"start":"2026-10-01T20:00:00+08:00","end":"2026-10-01T21:00:00+08:00"}]}'
+# 12:00–13:00 在班次 08–16 内（系统无停机）→ field_only；
+# 20:00–21:00 在所有已结算班次之外 → unreconciled
+
+# 固定历史序号重放：即使之后又有更正/裁定，结果与当时一致
+curl -X POST http://localhost:8000/devices/CNC-01/downtime-reconciliation \
+  -H 'Content-Type: application/json' \
+  -d '{"start":"2026-10-01T00:00:00+08:00","end":"2026-10-02T00:00:00+08:00",
+       "seq":1,"field_intervals":[]}'
+
+# 错误示例
+# seq 越界 → 422 INVALID_SEQ；历史修订无明细 → 422 SEGMENTS_UNAVAILABLE
+curl -X POST http://localhost:8000/devices/CNC-01/downtime-reconciliation -H 'Content-Type: application/json' \
+  -d '{"start":"2026-10-01T00:00:00+08:00","end":"2026-10-02T00:00:00+08:00","seq":999,"field_intervals":[]}'
+# 窗口缺时区 / 未对齐整分钟 / start≥end、现场区间非法 → 422 VALIDATION_ERROR；未知设备 → 404
+```
+
 ## 设计要点
 
 - **归因算法**（`app/attribution.py`，纯标准库可独立测试）：按原因收集区间并裁剪到班次窗口；
@@ -801,6 +911,14 @@ curl 'http://localhost:8000/devices/NOPE/shift-snapshots?start=2026-10-01T00:00:
   （载荷含设备、UTC 归一化窗口、快照序号与本页末班次 id，密钥取 `CURSOR_SECRET`），
   验签并逐项比对本次筛选条件，损坏/伪造/不匹配一律 `422 INVALID_CURSOR`；
   快照序号与 `/changes` 游标同一序列，可直接衔接增量同步。
+- **现场停机对账**（`app/reconciliation.py`，纯标准库可独立测试）：现场区间裁剪到窗口并
+  合并后，与"系统停机并集"（各相交班次按固定序号所选最后修订的固化明细三类段合并，
+  只读不可变历史）做半开区间差集；已结算覆盖为各班次窗口交集的并集 ——
+  现场差异 = 现场 ∩ 覆盖 − 系统，系统差异 = 系统 − 现场（系统段恒在覆盖内），
+  未对账 = 现场 − 覆盖；差集结果天然按时间排序且为最大连续区间，端点相接不漏分钟。
+  序号选取复用班次快照的"每组最大修订号"子查询；所选修订 `segments_available=FALSE`
+  （明细结构引入前的历史修订，裁定状态无法可靠还原）或序号越界时整体拒绝，
+  绝不用当前状态替代；响应回传固定序号与各班次所选修订，可原样重放。
 
 ## 项目结构
 
@@ -809,12 +927,14 @@ app/
   main.py         # FastAPI 路由
   services.py     # 业务逻辑：版本链、幂等、结算、更正重算
   attribution.py  # 归因算法（半开区间运算，纯标准库）
+  reconciliation.py # 现场-系统对账算法（裁剪/覆盖/差集，纯标准库）
   models.py       # SQLAlchemy 模型
   schemas.py      # Pydantic 请求/响应与校验
   db.py           # 引擎、会话、建库建表（含排他约束）
   config.py       # 环境变量配置
 tests/
   test_attribution.py    # 算法单测（含裁定覆盖/重叠/回退与区间明细拆段合并，无外部依赖，可 python3 直接跑）
+  test_reconciliation.py # 对账算法单测（裁剪合并/覆盖差集/未对账/最大连续区间，无外部依赖，可 python3 直接跑）
   test_api.py            # API 端到端测试（需 PostgreSQL）
   test_changes.py        # 变更同步（游标分页/回放/并发）端到端测试（需 PostgreSQL）
   test_adjudications.py  # 现场裁定（提交/幂等/冲突/撤销/联动/并发）端到端测试（需 PostgreSQL）
@@ -822,6 +942,7 @@ tests/
   test_event_preview.py  # 事件预演与确认（只读预演/凭据/状态复核/幂等重试/并发）端到端测试（需 PostgreSQL）
   test_shift_snapshots.py  # 班次快照（固定序号/相交过滤/稳定翻页/不可变/游标校验）端到端测试（需 PostgreSQL）
   test_result_segments.py  # 归因区间明细（固化/不可变/依据形态/历史不可用/错误语义）端到端测试（需 PostgreSQL）
+  test_downtime_reconciliation.py  # 现场停机对账（固定序号/最后修订明细并集/覆盖内外/未对账/序号越界与明细不可用）端到端测试（需 PostgreSQL）
 scripts/smoke.sh         # 冒烟脚本
 Dockerfile / docker-compose.yml / requirements.txt
 ```
