@@ -9,7 +9,7 @@ import json
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, func, or_, select, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -1430,3 +1430,172 @@ def get_shift_snapshot(
             device_id, win_start, win_end, snapshot_seq, page[-1][0].id
         )
     return page, snapshot_seq, next_cursor
+
+
+# ---------------------------------------------------------------- 现场停机对账
+
+
+def _interval_out(iv) -> dict:
+    s, e = iv
+    return {
+        "start": s,
+        "end": e,
+        "minutes": int((e - s).total_seconds()) // 60,
+    }
+
+
+def reconcile_device(
+    db: Session,
+    device_id: str,
+    start: datetime,
+    end: datetime,
+    site_intervals: list[tuple[datetime, datetime]],
+    seq: int | None,
+) -> dict:
+    """按设备对现场停机记录与截至 seq 的已结算归因做对账。
+
+    - 现场区间先裁剪到半开窗口 [start, end) 并合并重叠/相接；
+    - 系统侧：与窗口相交的班次各取 seq ≤ 对账序号的最后修订，其固化明细
+      （三类归因段）裁剪到窗口后的并集代表系统停机；修订未固化明细时
+      明确报错，不以当前状态推算；
+    - 只在窗口内已结算班次覆盖的分钟上比较：
+      site_only = 现场 − 系统（限定在覆盖域内），
+      system_only = 系统 − 现场（系统段本就只取自已结算班次），
+      unreconciled = 现场 − 覆盖域（窗口内无已结算班次的分钟，不算差异）。
+
+    返回可直接构造 ReconciliationOut 的 dict；区间统一归一化为 UTC。
+    """
+    get_device_or_404(db, device_id)
+    win_start, win_end = _utc(start), _utc(end)
+
+    # 未指定序号：固定为查询开始时已提交的最大序号（之后提交的修订不可见）
+    max_committed_seq = _current_max_seq(db)
+    if seq is None:
+        at_seq = max_committed_seq
+    elif seq > max_committed_seq:
+        raise ApiError(
+            422,
+            "INVALID_RECONCILIATION_SEQ",
+            f"reconciliation seq {seq} is beyond the latest committed "
+            f"seq {max_committed_seq}; specify a seq no greater than the "
+            "current maximum (0 is a valid empty reconciliation)",
+        )
+    else:
+        at_seq = seq
+
+    # 与窗口相交、截至 at_seq 已有修订（即已结算）的班次，各取序号 ≤ at_seq
+    # 的最后修订 —— 与班次快照同一选取口径，历史修订不可变
+    last_rev_subq = (
+        select(
+            ShiftResult.shift_id.label("shift_id"),
+            func.max(ShiftResult.revision).label("max_revision"),
+        )
+        .where(ShiftResult.seq <= at_seq)
+        .group_by(ShiftResult.shift_id)
+        .subquery()
+    )
+    rows = db.execute(
+        select(Shift, ShiftResult)
+        .join(ShiftResult, ShiftResult.shift_id == Shift.id)
+        .join(
+            last_rev_subq,
+            and_(
+                last_rev_subq.c.shift_id == ShiftResult.shift_id,
+                last_rev_subq.c.max_revision == ShiftResult.revision,
+            ),
+        )
+        .where(
+            Shift.device_id == device_id,
+            Shift.start_ts < win_end,
+            Shift.end_ts > win_start,
+        )
+        .order_by(Shift.id)
+    ).all()
+    settled: list[tuple[Shift, ShiftResult]] = [(shift, rev) for shift, rev in rows]
+
+    # 任一参与对账的修订缺少固化明细 → 明确报错（历史修订不可用，禁止以当前结果替代）
+    for shift, rev in settled:
+        if not rev.segments_available:
+            raise ApiError(
+                422,
+                "SEGMENTS_UNAVAILABLE",
+                f"shift id={shift.id} revision {rev.revision} (seq {rev.seq}) "
+                "has no frozen segment details; reconciliation against this "
+                "revision is impossible and current state is never substituted. "
+                "Choose a different reconciliation seq at which all intersecting "
+                "settled shifts have segment details",
+            )
+
+    keys = [(shift.id, rev.revision) for shift, rev in settled]
+    segment_rows = []
+    if keys:
+        segment_rows = (
+            db.execute(
+                select(ShiftResultSegment)
+                .where(tuple_(ShiftResultSegment.shift_id, ShiftResultSegment.revision).in_(keys))
+                .order_by(
+                    ShiftResultSegment.shift_id,
+                    ShiftResultSegment.seg_no,
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    # 覆盖域：已结算班次裁剪到窗口后的并集（同设备班次互不重叠）
+    covered_parts: list[tuple[datetime, datetime]] = []
+    shifts_out: list[dict] = []
+    for shift, rev in settled:
+        part = attribution._clip(shift.start_ts, shift.end_ts, win_start, win_end)
+        if part is None:
+            continue  # 半开相交判定下不会发生，稳妥起见
+        covered_parts.append(part)
+        shifts_out.append(
+            {
+                "shift_id": shift.id,
+                "start": shift.start_ts,
+                "end": shift.end_ts,
+                "revision": rev.revision,
+                "covered_start": part[0],
+                "covered_end": part[1],
+            }
+        )
+    covered = attribution.merge(covered_parts)
+
+    # 系统停机：所选修订的三类归因段（并集）裁剪到覆盖域/窗口
+    system = attribution.merge(
+        [
+            (max(seg.start_ts, win_start), min(seg.end_ts, win_end))
+            for seg in segment_rows
+            if seg.start_ts < win_end and seg.end_ts > win_start
+        ]
+    )
+
+    # 现场停机：先裁剪到窗口，再合并重叠/相接
+    site_utc = [(_utc(s), _utc(e)) for s, e in site_intervals]
+    site = attribution.merge(
+        attribution.intersect(site_utc, [(win_start, win_end)])
+    )
+
+    # 仅在覆盖域内比较：现场有而系统无
+    site_in_scope = attribution.intersect(site, covered)
+    site_only = attribution.subtract(site_in_scope, system)
+    # 系统有而现场无（系统段全部落在已结算班次内）
+    system_only = attribution.subtract(system, site)
+    # 窗口内不在任何已结算班次的现场分钟：另计为未对账，不算差异
+    unreconciled = attribution.subtract(site, covered)
+
+    return {
+        "device_id": device_id,
+        "start": win_start,
+        "end": win_end,
+        "seq": at_seq,
+        "site_only": [_interval_out(iv) for iv in site_only],
+        "site_only_minutes": attribution.total_minutes(site_only),
+        "system_only": [_interval_out(iv) for iv in system_only],
+        "system_only_minutes": attribution.total_minutes(system_only),
+        "unreconciled": [_interval_out(iv) for iv in unreconciled],
+        "unreconciled_minutes": attribution.total_minutes(unreconciled),
+        "compared_minutes": attribution.total_minutes(covered),
+        "shifts": shifts_out,
+    }

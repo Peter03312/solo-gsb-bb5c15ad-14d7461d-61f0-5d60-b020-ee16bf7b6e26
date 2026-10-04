@@ -31,6 +31,10 @@ from .schemas import (
     EventPreviewOut,
     EventVersionRef,
     ReasonMinutes,
+    ReconciliationIn,
+    ReconciliationOut,
+    ReconcileIntervalOut,
+    ReconcileShiftOut,
     RecomputedShift,
     ResultOut,
     ResultSegmentOut,
@@ -54,7 +58,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="设备停机归因服务",
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "按班次对设备停机时间进行归因（保养/故障/待判）。"
         "区间均为半开 [start, end)；重叠时保养 > 故障 > 待判，每分钟只归因一次；"
@@ -70,7 +74,10 @@ app = FastAPI(
         "供下游报表首次接入或重建索引；"
         "GET /shifts/{shift_id}/result/segments 提供与修订同事务固化的不可变归因区间"
         "明细（按起点排序、互不重叠的半开区间，含起止、原因及依据），"
-        "历史修订未固化明细时明确返回不可用。"
+        "历史修订未固化明细时明确返回不可用；"
+        "POST /devices/{device_id}/reconciliation 按固定变更序号对现场停机记录与"
+        "已结算归因做设备级对账：仅在已结算班次覆盖分钟比较，现场有/系统无与"
+        "系统有/现场无的最大连续区间分别列出，未覆盖的现场分钟另计为未对账。"
     ),
     lifespan=lifespan,
 )
@@ -617,4 +624,52 @@ def get_shift_snapshot(
         snapshot_seq=snapshot_seq,
         shifts=[_snapshot_entry(shift, rev) for shift, rev in page],
         next_cursor=next_cursor,
+    )
+
+
+# ---------------------------------------------------------------- 现场停机对账
+
+
+@app.post(
+    "/devices/{device_id}/reconciliation",
+    response_model=ReconciliationOut,
+    tags=["reconciliation"],
+)
+def reconcile_device(device_id: str, payload: ReconciliationIn, db: Session = Depends(get_db)):
+    """现场停机记录与系统已结算归因按设备对账（按固定变更序号重放）。
+
+    - 现场区间先裁剪到半开窗口 [start, end) 并合并重叠/相接；
+    - 系统侧取与窗口相交班次的 **seq ≤ 对账序号的最后修订** 及其固化归因段，
+      以三类归因段（保养/故障/待判）的并集代表系统停机；
+    - 只在该序号已结算班次覆盖的分钟上比较，按时间顺序返回
+      现场有而系统无（site_only）、系统有而现场无（system_only）的最大连续
+      区间及分钟总数；窗口内不在已结算班次的现场分钟计入 unreconciled，
+      不算差异；结果回传所用 seq，原样重放必得同一结果；
+    - 422 SEGMENTS_UNAVAILABLE：参与对账的某历史修订未固化明细
+      （结构引入前的修订，禁止以当前状态替代，可换用更晚序号）；
+      422 INVALID_RECONCILIATION_SEQ：序号超过当前已提交最大序号；
+      422 VALIDATION_ERROR：窗口/现场区间缺时区、未对齐整分钟或 start ≥ end；
+      404 DEVICE_NOT_FOUND：未知设备。
+    """
+    result = services.reconcile_device(
+        db,
+        device_id,
+        payload.start,
+        payload.end,
+        [(iv.start, iv.end) for iv in payload.site_intervals],
+        payload.seq,
+    )
+    return ReconciliationOut(
+        device_id=result["device_id"],
+        start=payload.start,
+        end=payload.end,
+        seq=result["seq"],
+        site_only=[ReconcileIntervalOut(**iv) for iv in result["site_only"]],
+        site_only_minutes=result["site_only_minutes"],
+        system_only=[ReconcileIntervalOut(**iv) for iv in result["system_only"]],
+        system_only_minutes=result["system_only_minutes"],
+        unreconciled=[ReconcileIntervalOut(**iv) for iv in result["unreconciled"]],
+        unreconciled_minutes=result["unreconciled_minutes"],
+        compared_minutes=result["compared_minutes"],
+        shifts=[ReconcileShiftOut(**s) for s in result["shifts"]],
     )

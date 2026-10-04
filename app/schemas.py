@@ -334,3 +334,85 @@ class AdjudicationAck(BaseModel):
     revision: int | None  # 本次操作产生的修订号；无修订为 null
     latest_revision: int  # 班次当前最新修订号
     revision_detail: RevisionRef | None = None  # 本次修订摘要；无修订为 null
+
+
+# ---------------------------------------------------------------- 现场对账
+
+
+#: 对账请求中现场停机区间条数上限（防止超大请求）
+MAX_RECONCILE_INTERVALS = 1000
+
+
+class SiteInterval(_Interval):
+    """一条现场停机记录：半开区间 [start, end)，带时区且精确到整分钟。"""
+
+
+class ReconciliationIn(BaseModel):
+    """现场停机记录与系统已结算归因的按设备对账请求。
+
+    - 窗口为半开 [start, end)，必须带时区且精确到整分钟；
+    - site_intervals 为现场停机区间（可重叠/相接，服务端先裁剪到窗口再合并），
+      允许空列表（现场无停机，系统停机全部计为系统多报）；
+    - seq 缺省时固定为查询开始时已提交的最大变更序号。
+    """
+
+    start: datetime
+    end: datetime
+    site_intervals: list[SiteInterval] = Field(
+        default_factory=list, max_length=MAX_RECONCILE_INTERVALS
+    )
+    seq: int | None = Field(default=None, ge=0)
+
+    @field_validator("start", "end")
+    @classmethod
+    def _ts(cls, v: datetime) -> datetime:
+        return _check_ts(v)
+
+    @model_validator(mode="after")
+    def _range(self):
+        if not self.start < self.end:
+            raise ValueError("invalid window: start must be earlier than end (half-open [start, end))")
+        return self
+
+
+class ReconcileIntervalOut(BaseModel):
+    """对账差异 / 未对账中的一个最大连续半开区间（输出统一归一化为 UTC）。"""
+
+    start: datetime
+    end: datetime
+    minutes: int
+
+
+class ReconcileShiftOut(BaseModel):
+    """参与本次对账的一个已结算班次（审计用：系统侧所用修订与其覆盖窗口）。"""
+
+    shift_id: int
+    start: datetime  # 班次区间（裁剪前，UTC）
+    end: datetime
+    revision: int  # 序号 ≤ 对账序号的最后修订号
+    covered_start: datetime  # 班次与对账窗口相交、实际参与比较的部分（UTC）
+    covered_end: datetime
+
+
+class ReconciliationOut(BaseModel):
+    """按设备对账结果。
+
+    - 只在"截至对账序号已结算班次"覆盖的分钟上比较现场与系统停机；
+    - site_only：现场有停机而系统无停机的最大连续区间（系统少报）；
+    - system_only：系统有停机而现场无停机的最大连续区间（系统多报）；
+    - unreconciled：现场停机落在窗口内但不在任何已结算班次的分钟（另计，不算差异）；
+    - seq 为本次实际使用的变更序号；显式传入时原样回放，缺省为查询开始时的最新序号。
+    """
+
+    device_id: str
+    start: datetime
+    end: datetime
+    seq: int
+    site_only: list[ReconcileIntervalOut]
+    site_only_minutes: int
+    system_only: list[ReconcileIntervalOut]
+    system_only_minutes: int
+    unreconciled: list[ReconcileIntervalOut]
+    unreconciled_minutes: int
+    compared_minutes: int  # 窗口内已结算班次覆盖的分钟总数（实际参与比较的分钟）
+    shifts: list[ReconcileShiftOut]

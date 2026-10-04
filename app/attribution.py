@@ -63,6 +63,29 @@ def merge(intervals: Iterable[Interval]) -> list[Interval]:
     return [(s, e) for s, e in out]
 
 
+def intersect(intervals_a: Iterable[Interval], intervals_b: Iterable[Interval]) -> list[Interval]:
+    """两组半开区间并集的交集：返回按起点排序、互不重叠（相接合并）的区间列表。"""
+    a = merge(intervals_a)
+    b = merge(intervals_b)
+    out: list[Interval] = []
+    i = j = 0
+    while i < len(a) and j < len(b):
+        s, e = a[i]
+        cs, ce = b[j]
+        lo, hi = max(s, cs), min(e, ce)
+        if lo < hi:
+            out.append((lo, hi))
+        # 末端较小者前进；末端相同（端点相接）时两者都前进
+        if e < ce:
+            i += 1
+        elif ce < e:
+            j += 1
+        else:
+            i += 1
+            j += 1
+    return merge(out)
+
+
 def subtract(intervals: Iterable[Interval], covers: Iterable[Interval]) -> list[Interval]:
     """从 intervals 中扣除 covers 的并集（均为半开区间）。"""
     merged_covers = merge(covers)
